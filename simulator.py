@@ -50,13 +50,18 @@ class Topology:
 
 
 # ==================================================
-# GPU
+# GPUs
 # ==================================================
-class GPU:
+class Blackwell:
     def __init__(self, efficiency_factor, t_launch):
         self.efficiency_factor = efficiency_factor
         self.t_launch = t_launch  # [s]
-        self.tensor_memory = 40960  # [KB]
+        self.sm_l1_size = 256  # [KB]
+        self.number_sm = 160
+        self.number_dies = 2
+        self.memory = self.sm_l1_size * self.number_sm  # total memory [KB] in the chip
+        self.hbi_bw = 10 * (2 ** 30)  # [KB/s]
+        self.hbi_launch = 1e-7  # [sec]
 
     def get_achieved_tflops(self, element_type):
         peak = {
@@ -67,6 +72,33 @@ class GPU:
             "nvfp4": 15000
         }  # [TFLOPS]
         return peak[element_type] * self.efficiency_factor
+
+    def get_inner_gpu_overhead(self, v):
+        return self.hbi_launch + (v / self.hbi_bw)
+
+
+class RTX3090:
+    def __init__(self, efficiency_factor, t_launch):
+        self.efficiency_factor = efficiency_factor
+        self.t_launch = t_launch  # [s]
+        self.sm_l1_size = 128  # [KB]
+        self.number_sm = 82
+        self.number_dies = 1
+        self.memory = self.sm_l1_size * self.number_sm  # total memory [KB] in the chip
+
+    def get_achieved_tflops(self, element_type):
+        peak = {
+            "fp32": 35.6,
+            "fp16": 142,
+            "bf16": 71.2,
+            "fp8": "N/A",
+            "nvfp4": "N/A"
+        }  # [TFLOPS]
+        return peak[element_type] * self.efficiency_factor
+
+    # there is only one die in this chip so there is no overhead
+    def get_inner_gpu_overhead(self, v):
+        return 0
 
 
 # ==================================================
@@ -91,10 +123,16 @@ class Simulator:
         }[self.element_type] / (2 ** 10)  # [KB]
 
     def calculate_t_comp(self, b, c):
+        # calculating compute time
         total_gpus = self.inner_topology.size * self.outer_topology.size
         flops = 2 * (b / c) * self.dim * (self.r * self.dim / total_gpus)  # [FLOPs]
         achieved = self.gpu.get_achieved_tflops(self.element_type) * 1e12  # [FLOP / sec]
-        return self.gpu.t_launch + (flops / achieved)
+        # calculating inner chip communication time
+        elem_size = self.get_elem_size()
+        num_gpus = self.inner_topology.size * self.outer_topology.size
+        v_gpu = (1 / num_gpus) * b * self.r * self.dim * elem_size
+        inner_gpu_overhead = self.gpu.get_inner_gpu_overhead(v_gpu / self.gpu.number_dies)
+        return self.gpu.t_launch + (flops / achieved) + inner_gpu_overhead
 
     def calculate_t_comm(self, b, c):
         elem_size = self.get_elem_size()
@@ -137,7 +175,7 @@ class Simulator:
         return is_pareto
 
     def solve_pareto_method_1(self):
-        max_mem = self.gpu.tensor_memory
+        max_mem = self.gpu.memory
         combinations = []
         for i in range(20):
             b = 2 ** i
@@ -164,87 +202,80 @@ class Simulator:
         return results, pareto_points
 
     # ------------------------------------------------------------------
-    # Method 2: Pymoo Genetic Algorithm (NSGA-II)
+    # Method 2: Pymoo Genetic Algorithm (NSGA-II) - ROBUST VERSION
     # ------------------------------------------------------------------
     def solve_pareto_pymoo(self):
-        print("[Method 2] Running NSGA-II optimization...")
+        print("\n" + "=" * 40)
+        print("[Method 2] Running NSGA-II with Defensive Clamping...")
 
-        # We need a reference to 'self' inside the Problem class
         simulator_instance = self
+
+        # 1. Define Hard Limits
+        max_b_limit = 2 ** 20  # 1,048,576
+        max_c_limit = 2048
 
         class GPUOptimizationProblem(ElementwiseProblem):
             def __init__(self):
-                # Decision Variables:
-                # x0: exponent for Batch Size B (where B = 2^x0). Range [0, 20]
-                # x1: Chunk Size C. Range [1, 2048]
                 super().__init__(n_var=2,
                                  n_obj=2,
-                                 n_ieq_constr=2,  # 2 constraints
-                                 xl=np.array([0, 1]),
-                                 xu=np.array([20, 2048]))
+                                 n_ieq_constr=2,
+                                 xl=np.array([1, 1]),
+                                 xu=np.array([max_b_limit, max_c_limit]))
 
             def _evaluate(self, x, out, *args, **kwargs):
-                # 1. Decode Variables
-                b_exp = int(x[0])
-                c = int(x[1])
-                b = 2 ** b_exp
+                # --- DEFENSIVE CODING START ---
+                # Force-Clamp variables to valid range.
+                # This prevents the "48 billion" bug if the optimizer drifts.
+                b = int(np.clip(x[0], 1, max_b_limit))
+                c = int(np.clip(x[1], 1, max_c_limit))
+                # --- DEFENSIVE CODING END ---
 
-                # 2. Objectives
-                f1 = simulator_instance.opt_func_1([b, c])  # Total Time
-                f2 = simulator_instance.opt_func_2([b, c])  # Negative Throughput (minimized)
+                # Objectives
+                f1 = simulator_instance.opt_func_1([b, c])
+                f2 = simulator_instance.opt_func_2([b, c])
 
-                # 3. Constraints (must be <= 0 to be satisfied)
-
-                # Constraint A: Memory Usage <= Max Memory
-                # Usage - Max <= 0
+                # Constraint A: Memory Check
                 mem_usage = (b / c) * simulator_instance.dim * simulator_instance.get_elem_size()
-                g1 = mem_usage - simulator_instance.gpu.tensor_memory
+                g1 = mem_usage - simulator_instance.gpu.memory
 
-                # Constraint B: Chunk size C cannot be larger than Batch size B
-                # C - B <= 0
+                # Constraint B: Logical Check (c <= b)
                 g2 = c - b
 
                 out["F"] = [f1, f2]
                 out["G"] = [g1, g2]
 
-        # Initialize Problem
         problem = GPUOptimizationProblem()
 
-        # Configure Algorithm (NSGA-II)
-        # Using specific integer operators (crossover/mutation)
+        # Configure Algorithm
         algorithm = NSGA2(
-            pop_size=50,
-            n_offsprings=20,
+            pop_size=100,
+            n_offsprings=40,
             sampling=IntegerRandomSampling(),
             crossover=SBX(prob=0.9, eta=15),
             mutation=PM(eta=20),
             eliminate_duplicates=True
         )
 
-        # Run Optimization
         res = minimize(problem,
                        algorithm,
-                       ('n_gen', 200),  # Number of generations
+                       ('n_gen', 200),
                        seed=42,
                        verbose=False)
 
         # Process Results
-        # Pymoo returns 'res.F' (objectives) and 'res.X' (variables)
-        # We need to format them back into [b, c, f1, throughput] for plotting
-
         pareto_results = []
         if res.X is not None:
             for i in range(len(res.X)):
-                b_exp = int(res.X[i, 0])
-                c = int(res.X[i, 1])
-                b = 2 ** b_exp
+                # Apply the same clamping to the results we save
+                b = int(np.clip(res.X[i, 0], 1, max_b_limit))
+                c = int(np.clip(res.X[i, 1], 1, max_c_limit))
 
                 f1_val = res.F[i, 0]
                 f2_val_neg = res.F[i, 1]
 
-                # Store: [b, c, total_time, throughput (positive)]
                 pareto_results.append([b, c, f1_val, -f2_val_neg])
 
+        print(f"[Method 2] Done. Found {len(pareto_results)} solutions.")
         return np.array(pareto_results)
 
     # ==================================================
@@ -278,7 +309,7 @@ class Simulator:
             )
 
         plt.xlabel("Objective 1: Total Time [sec] (Minimize)")
-        plt.ylabel("Objective 2: Throughput [KB / sec] (Maximize)")
+        plt.ylabel("Objective 2: Throughput [Batch / sec] (Maximize)")
         plt.title(f"Pareto Front {title_suffix}")
         plt.grid(True, alpha=0.3)
         plt.legend()
@@ -292,20 +323,34 @@ class Simulator:
 if __name__ == "__main__":
     nvlink = Topology("tree", 72, "nvlink", 0.003)
     infiniband = Topology("linear", 2, "infiniband", 0.01)
-    gpu = GPU(0.4, 0.01)
+    blackwell_gpu = Blackwell(0.5, 0.01)
+    rtx3090_gpu = RTX3090(0.5, 0.01)
 
     sim = Simulator(
         inner_topology=nvlink,
         outer_topology=infiniband,
-        gpu=gpu,
+        gpu=blackwell_gpu,
         dim=4096,
         r=4,
         element_type="fp32"
     )
 
-    # --- Run Method 1 (Brute Force) ---
+    sim2 = Simulator(
+        inner_topology=nvlink,
+        outer_topology=infiniband,
+        gpu=rtx3090_gpu,
+        dim=4096,
+        r=4,
+        element_type="fp32"
+    )
+
+    # --- Run Method 1 (Brute Force - Blackwell) ---
     all_points_1, pareto_points_1 = sim.solve_pareto_method_1()
-    sim.plot_pareto(pareto_points_1, title_suffix="(Method 1: Brute Force)")
+    sim.plot_pareto(pareto_points_1, title_suffix="(Method 1: Brute Force - Blackwell)")
+
+    # --- Run Method 1 (Brute Force - RTX3090) ---
+    all_points_r, pareto_points_r = sim2.solve_pareto_method_1()
+    sim.plot_pareto(pareto_points_r, title_suffix="(Method 1: Brute Force - RTX3090)")
 
     # --- Run Method 2 (Pymoo NSGA-II) ---
     # Note: Genetic algorithms don't typically return "all feasible points", only the optimal set
