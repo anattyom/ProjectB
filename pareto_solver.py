@@ -52,53 +52,91 @@ class Topology:
 # ==================================================
 # GPUs
 # ==================================================
-class Blackwell:
-    def __init__(self, efficiency_factor, t_launch):
+# ==================================================
+# GPUs
+# ==================================================
+class GPU:
+    def __init__(self,
+                 efficiency_factor,
+                 t_launch,
+                 sm_l1_size,
+                 number_sm,
+                 number_dies,
+                 peak_flops_dict,
+                 hbi_bw=None,
+                 hbi_launch=0.0):
+        """
+        Base Generic GPU Class.
+        """
         self.efficiency_factor = efficiency_factor
         self.t_launch = t_launch  # [s]
-        self.sm_l1_size = 256  # [KB]
-        self.number_sm = 160
-        self.number_dies = 2
-        self.memory = self.sm_l1_size * self.number_sm  # total memory [KB] in the chip
-        self.hbi_bw = 10 * (2 ** 30)  # [KB/s]
-        self.hbi_launch = 1e-7  # [sec]
+        self.sm_l1_size = sm_l1_size  # [KB]
+        self.number_sm = number_sm
+        self.number_dies = number_dies
+
+        # Auto-calculate total memory
+        self.memory = self.sm_l1_size * self.number_sm  # [KB]
+
+        self.peak_flops_dict = peak_flops_dict  # Dictionary of peaks
+        self.hbi_bw = hbi_bw  # [KB/s] (Die-to-Die Bandwidth)
+        self.hbi_launch = hbi_launch  # [s] (Die-to-Die Latency)
 
     def get_achieved_tflops(self, element_type):
-        peak = {
-            "fp32": 495,
-            "fp16": 990,
-            "bf16": 990,
-            "fp8": 1980,
-            "nvfp4": 15000
-        }  # [TFLOPS]
-        return peak[element_type] * self.efficiency_factor
+        if element_type not in self.peak_flops_dict:
+            raise ValueError(f"Precision '{element_type}' not supported by this GPU.")
+
+        peak_val = self.peak_flops_dict[element_type]
+
+        if peak_val == "N/A":
+            raise ValueError(f"Precision '{element_type}' is N/A for this GPU.")
+
+        return peak_val * self.efficiency_factor
 
     def get_inner_gpu_overhead(self, v):
+        # If single die, no internal communication overhead
+        if self.number_dies <= 1 or self.hbi_bw is None:
+            return 0
+
+        # Logic: Latency + (Volume / Bandwidth)
         return self.hbi_launch + (v / self.hbi_bw)
 
 
-class RTX3090:
+class Blackwell(GPU):
     def __init__(self, efficiency_factor, t_launch):
-        self.efficiency_factor = efficiency_factor
-        self.t_launch = t_launch  # [s]
-        self.sm_l1_size = 128  # [KB]
-        self.number_sm = 82
-        self.number_dies = 1
-        self.memory = self.sm_l1_size * self.number_sm  # total memory [KB] in the chip
+        super().__init__(
+            efficiency_factor=efficiency_factor,
+            t_launch=t_launch,
+            sm_l1_size=256,  # [KB]
+            number_sm=160,
+            number_dies=2,
+            peak_flops_dict={
+                "fp32": 495,
+                "fp16": 990,
+                "bf16": 990,
+                "fp8": 1980,
+                "nvfp4": 15000
+            },
+            hbi_bw=10 * (2 ** 30),  # 10 TB/s -> KB/s
+            hbi_launch=1e-7  # 100 ns
+        )
 
-    def get_achieved_tflops(self, element_type):
-        peak = {
-            "fp32": 35.6,
-            "fp16": 142,
-            "bf16": 71.2,
-            "fp8": "N/A",
-            "nvfp4": "N/A"
-        }  # [TFLOPS]
-        return peak[element_type] * self.efficiency_factor
 
-    # there is only one die in this chip so there is no overhead
-    def get_inner_gpu_overhead(self, v):
-        return 0
+class RTX3090(GPU):
+    def __init__(self, efficiency_factor, t_launch):
+        super().__init__(
+            efficiency_factor=efficiency_factor,
+            t_launch=t_launch,
+            sm_l1_size=128,  # [KB]
+            number_sm=82,
+            number_dies=1,
+            peak_flops_dict={
+                "fp32": 35.6,
+                "fp16": 142,
+                "bf16": 71.2,
+                "fp8": "N/A",
+                "nvfp4": "N/A"
+            }
+        )
 
 
 # ==================================================
@@ -174,16 +212,25 @@ class Simulator:
             is_pareto[dominates] = False
         return is_pareto
 
-    def solve_pareto_method_1(self):
+    def solve_pareto_brute_force(self, fast_mode=False):
         max_mem = self.gpu.memory
         combinations = []
-        for i in range(20):
-            b = 2 ** i
-            for c in range(1, b + 1):
-                if (b / c) * self.dim * self.get_elem_size() <= max_mem:
-                    combinations.append((b, c))
+        b_range = [2**i for i in range(20)]
+        for b in b_range:
+            if fast_mode:
+                # SPARSE GRID: Only check powers of 2 up to 32
+                c_candidates = [1, 2, 4, 8, 16, 32]
+            else:
+                # FULL SEARCH: Check every integer (Slow!)
+                c_candidates = range(1, b + 1)
 
-        print(f"[Method 1] Evaluating {len(combinations)} (B, C) pairs...")
+            for c in c_candidates:
+                if c > b:
+                    continue
+                elif (b / c) * self.dim * self.get_elem_size() <= max_mem:
+                    combinations.append((b, c))
+        if not fast_mode:
+            print(f"[Method 1] Evaluating {len(combinations)} (B, C) pairs...")
 
         def evaluate(pair):
             b, c = pair
@@ -204,9 +251,25 @@ class Simulator:
     # ------------------------------------------------------------------
     # Method 2: Pymoo Genetic Algorithm (NSGA-II) - ROBUST VERSION
     # ------------------------------------------------------------------
-    def solve_pareto_pymoo(self):
-        print("\n" + "=" * 40)
-        print("[Method 2] Running NSGA-II with Defensive Clamping...")
+    def solve_pareto_pymoo(self, fast_mode=False):
+        # Configure settings based on mode
+        if fast_mode:
+            # FAST MODE: Approx. 400 evaluations (20x faster)
+            # Good enough for inverse design loops
+            pop_size = 20
+            n_offsprings = 10
+            n_gen = 30
+            verbose = False
+        else:
+            # STANDARD MODE: Approx. 8,000 evaluations
+            # High fidelity for final plotting
+            pop_size = 100
+            n_offsprings = 40
+            n_gen = 200
+            verbose = False
+        if not fast_mode:
+            print("\n" + "=" * 40)
+            print("[Method 2] Running NSGA-II...")
 
         simulator_instance = self
 
@@ -246,10 +309,10 @@ class Simulator:
 
         problem = GPUOptimizationProblem()
 
-        # Configure Algorithm
+        # Configure Algorithm dynamically based on mode
         algorithm = NSGA2(
-            pop_size=100,
-            n_offsprings=40,
+            pop_size=pop_size,
+            n_offsprings=n_offsprings,
             sampling=IntegerRandomSampling(),
             crossover=SBX(prob=0.9, eta=15),
             mutation=PM(eta=20),
@@ -260,7 +323,7 @@ class Simulator:
                        algorithm,
                        ('n_gen', 200),
                        seed=42,
-                       verbose=False)
+                       verbose=verbose)
 
         # Process Results
         pareto_results = []
@@ -345,15 +408,14 @@ if __name__ == "__main__":
     )
 
     # --- Run Method 1 (Brute Force - Blackwell) ---
-    all_points_1, pareto_points_1 = sim.solve_pareto_method_1()
+    all_points_1, pareto_points_1 = sim.solve_pareto_brute_force()
     sim.plot_pareto(pareto_points_1, title_suffix="(Method 1: Brute Force - Blackwell)")
 
     # --- Run Method 1 (Brute Force - RTX3090) ---
-    all_points_r, pareto_points_r = sim2.solve_pareto_method_1()
+    all_points_r, pareto_points_r = sim2.solve_pareto_brute_force()
     sim.plot_pareto(pareto_points_r, title_suffix="(Method 1: Brute Force - RTX3090)")
 
     # --- Run Method 2 (Pymoo NSGA-II) ---
-    # Note: Genetic algorithms don't typically return "all feasible points", only the optimal set
     pareto_points_2 = sim.solve_pareto_pymoo()
 
     # Check if we found solutions
