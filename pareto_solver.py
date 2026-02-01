@@ -57,12 +57,12 @@ class Topology:
 # ==================================================
 class GPU:
     def __init__(self,
-                 efficiency_factor,
                  t_launch,
                  sm_l1_size,
                  number_sm,
                  number_dies,
                  peak_flops_dict,
+                 efficiency_factor=0.5,
                  hbi_bw=None,
                  hbi_launch=0.0):
         """
@@ -102,7 +102,7 @@ class GPU:
 
 
 class Blackwell(GPU):
-    def __init__(self, efficiency_factor, t_launch):
+    def __init__(self, t_launch=0.01, efficiency_factor=0.5):
         super().__init__(
             efficiency_factor=efficiency_factor,
             t_launch=t_launch,
@@ -122,7 +122,7 @@ class Blackwell(GPU):
 
 
 class RTX3090(GPU):
-    def __init__(self, efficiency_factor, t_launch):
+    def __init__(self, t_launch, efficiency_factor=0.5):
         super().__init__(
             efficiency_factor=efficiency_factor,
             t_launch=t_launch,
@@ -229,8 +229,6 @@ class Simulator:
                     continue
                 elif (b / c) * self.dim * self.get_elem_size() <= max_mem:
                     combinations.append((b, c))
-        if not fast_mode:
-            print(f"[Method 1] Evaluating {len(combinations)} (B, C) pairs...")
 
         def evaluate(pair):
             b, c = pair
@@ -258,7 +256,7 @@ class Simulator:
             # Good enough for inverse design loops
             pop_size = 20
             n_offsprings = 10
-            n_gen = 30
+            n_gen = 15
             verbose = False
         else:
             # STANDARD MODE: Approx. 8,000 evaluations
@@ -267,9 +265,6 @@ class Simulator:
             n_offsprings = 40
             n_gen = 200
             verbose = False
-        if not fast_mode:
-            print("\n" + "=" * 40)
-            print("[Method 2] Running NSGA-II...")
 
         simulator_instance = self
 
@@ -338,7 +333,6 @@ class Simulator:
 
                 pareto_results.append([b, c, f1_val, -f2_val_neg])
 
-        print(f"[Method 2] Done. Found {len(pareto_results)} solutions.")
         return np.array(pareto_results)
 
     # ==================================================
@@ -386,8 +380,8 @@ class Simulator:
 if __name__ == "__main__":
     nvlink = Topology("tree", 72, "nvlink", 0.003)
     infiniband = Topology("linear", 2, "infiniband", 0.01)
-    blackwell_gpu = Blackwell(0.5, 0.01)
-    rtx3090_gpu = RTX3090(0.5, 0.01)
+    blackwell_gpu = Blackwell(0.01)
+    rtx3090_gpu = RTX3090(0.01)
 
     sim = Simulator(
         inner_topology=nvlink,
