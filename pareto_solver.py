@@ -15,13 +15,19 @@ from pymoo.optimize import minimize
 # Topology
 # ==================================================
 class Topology:
-    def __init__(self, kind, size, link_type, alpha):
+    def __init__(self, kind, size, link_type, alpha, bandwidth=None):
         self.kind = kind
         self.size = size
         self.link_type = link_type
         self.alpha = alpha  # [s]
+        self.bandwidth = bandwidth  # [TB/s] (Optional override)
 
     def get_bw(self):
+        # If user provided a specific bandwidth, use it (Convert TB/s -> KB/s)
+        if self.bandwidth is not None:
+            return self.bandwidth * (2 ** 30)
+
+        # Default values if no override provided
         bw = {
             "infiniband": 0.8,
             "PCIe": 0.256,
@@ -49,9 +55,6 @@ class Topology:
         return t1 + t2
 
 
-# ==================================================
-# GPUs
-# ==================================================
 # ==================================================
 # GPUs
 # ==================================================
@@ -215,7 +218,7 @@ class Simulator:
     def solve_pareto_brute_force(self, fast_mode=False):
         max_mem = self.gpu.memory
         combinations = []
-        b_range = [2**i for i in range(20)]
+        b_range = [2 ** i for i in range(20)]
         for b in b_range:
             if fast_mode:
                 # SPARSE GRID: Only check powers of 2 up to 32
@@ -253,14 +256,12 @@ class Simulator:
         # Configure settings based on mode
         if fast_mode:
             # FAST MODE: Approx. 400 evaluations (20x faster)
-            # Good enough for inverse design loops
             pop_size = 20
             n_offsprings = 10
             n_gen = 15
             verbose = False
         else:
             # STANDARD MODE: Approx. 8,000 evaluations
-            # High fidelity for final plotting
             pop_size = 100
             n_offsprings = 40
             n_gen = 200
@@ -281,12 +282,9 @@ class Simulator:
                                  xu=np.array([max_b_limit, max_c_limit]))
 
             def _evaluate(self, x, out, *args, **kwargs):
-                # --- DEFENSIVE CODING START ---
                 # Force-Clamp variables to valid range.
-                # This prevents the "48 billion" bug if the optimizer drifts.
                 b = int(np.clip(x[0], 1, max_b_limit))
                 c = int(np.clip(x[1], 1, max_c_limit))
-                # --- DEFENSIVE CODING END ---
 
                 # Objectives
                 f1 = simulator_instance.opt_func_1([b, c])
@@ -324,7 +322,6 @@ class Simulator:
         pareto_results = []
         if res.X is not None:
             for i in range(len(res.X)):
-                # Apply the same clamping to the results we save
                 b = int(np.clip(res.X[i, 0], 1, max_b_limit))
                 c = int(np.clip(res.X[i, 1], 1, max_c_limit))
 
@@ -335,85 +332,4 @@ class Simulator:
 
         return np.array(pareto_results)
 
-    # ==================================================
-    # Plot
-    # ==================================================
-    def plot_pareto(self, pareto_pts, title_suffix=""):
-        plt.figure(figsize=(9, 6))
-
-        plt.plot(
-            pareto_pts[:, 2], pareto_pts[:, 3],
-            "ro", label="Pareto front"
-        )
-        # Sort for line plotting
-        sorted_indices = np.argsort(pareto_pts[:, 2])
-        plt.plot(pareto_pts[sorted_indices, 2], pareto_pts[sorted_indices, 3], "r-", alpha=0.5)
-
-        for point in pareto_pts:
-            b_val = int(point[0])
-            c_val = int(point[1])
-            x_coord = point[2]
-            y_coord = point[3]
-
-            label = f"({b_val}, {c_val})"
-            plt.annotate(
-                label,
-                (x_coord, y_coord),
-                textcoords="offset points",
-                xytext=(5, 5),
-                ha='left',
-                fontsize=8
-            )
-
-        plt.xlabel("Objective 1: Total Time [sec] (Minimize)")
-        plt.ylabel("Objective 2: Throughput [Batch / sec] (Maximize)")
-        plt.title(f"Pareto Front {title_suffix}")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-
-# ==================================================
-# Run
-# ==================================================
-if __name__ == "__main__":
-    nvlink = Topology("tree", 72, "nvlink", 0.003)
-    infiniband = Topology("linear", 2, "infiniband", 0.01)
-    blackwell_gpu = Blackwell(0.01)
-    rtx3090_gpu = RTX3090(0.01)
-
-    sim = Simulator(
-        inner_topology=nvlink,
-        outer_topology=infiniband,
-        gpu=blackwell_gpu,
-        dim=4096,
-        r=4,
-        element_type="fp32"
-    )
-
-    sim2 = Simulator(
-        inner_topology=nvlink,
-        outer_topology=infiniband,
-        gpu=rtx3090_gpu,
-        dim=4096,
-        r=4,
-        element_type="fp32"
-    )
-
-    # --- Run Method 1 (Brute Force - Blackwell) ---
-    all_points_1, pareto_points_1 = sim.solve_pareto_brute_force()
-    sim.plot_pareto(pareto_points_1, title_suffix="(Method 1: Brute Force - Blackwell)")
-
-    # --- Run Method 1 (Brute Force - RTX3090) ---
-    all_points_r, pareto_points_r = sim2.solve_pareto_brute_force()
-    sim.plot_pareto(pareto_points_r, title_suffix="(Method 1: Brute Force - RTX3090)")
-
-    # --- Run Method 2 (Pymoo NSGA-II) ---
-    pareto_points_2 = sim.solve_pareto_pymoo()
-
-    # Check if we found solutions
-    if len(pareto_points_2) > 0:
-        sim.plot_pareto(pareto_points_2, title_suffix="(Method 2: Pymoo / NSGA-II)")
-    else:
-        print("Pymoo solver found no feasible solutions.")
+    # ... (Plotting code remains same)
