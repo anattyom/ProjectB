@@ -255,10 +255,11 @@ class Simulator:
     def solve_pareto_pymoo(self, fast_mode=False):
         # Configure settings based on mode
         if fast_mode:
-            # FAST MODE: Approx. 400 evaluations (20x faster)
-            pop_size = 20
-            n_offsprings = 10
-            n_gen = 15
+            # FAST MODE: Extremely aggressive speedup for inverse design
+            # We sacrifice some accuracy for speed (fewer evaluations)
+            pop_size = 10
+            n_offsprings = 5
+            n_gen = 5
             verbose = False
         else:
             # STANDARD MODE: Approx. 8,000 evaluations
